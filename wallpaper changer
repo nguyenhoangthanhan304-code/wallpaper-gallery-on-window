@@ -1,0 +1,1511 @@
+"""
+Wallpaper Gallery  (v5)
+───────────────────────
+• Reads wallpapers from the Windows default wallpaper folder
+  (%USERPROFILE%\\Pictures and the system Themes/wallpaper folder).
+• Uses ctypes / windows APIs to set the desktop wallpaper.
+• Parallelogram carousel: cards shrink linearly toward the edges,
+  stop shrinking after position 7, no opacity dimming on side cards,
+  outline glows on hover.
+• Applying a wallpaper:
+    1. The gallery starts fading out the moment a wallpaper is selected
+       (double-click), so the desktop is visible while the change plays.
+    2. A diagonal wipe plays: the new image sweeps in from the top-right
+       corner to the bottom-left corner (duration set by REVEAL_WIPE_MS).
+       The reveal window is reparented into the desktop's own WorkerW
+       layer (the same trick live-wallpaper tools use), so it renders
+       underneath every open application window and underneath the
+       desktop icons, above only the true static wallpaper.
+    3. When the wipe finishes, the real wallpaper is set on a background
+       thread (so nothing freezes). The reveal image stays on screen for
+       REVEAL_HOLD_MS after Windows reports the change, so the desktop
+       never shows a blank gap while Windows swaps its own wallpaper.
+    4. The reveal then fades away and ONLY THEN does the app exit: it
+       quits once the gallery has faded out, the wipe has finished, the
+       wallpaper has been applied and the reveal image is gone.
+• Toolbar: ALL | PIC | VID | WE | 🗓 | 🎨 [swatches] | ♥ | ↓ | ⚙ | total | fav
+
+Performance notes (perf pass):
+  - Thumbnails are cached once as a downscaled "master" pixmap sized to
+    the largest card (the centre card). All per-frame scaling during the
+    slide animation happens off this small master.
+  - While a slide animation is in flight, cards render with fast
+    (nearest-neighbour) scaling and antialiasing off; once the slide
+    settles, `_rebuild()` snaps everything back to smooth rendering.
+  - The device pixel ratio is resolved once at startup.
+
+Thumbnail loading pass:
+  - Thumbnails are loaded off the GUI thread on a QThreadPool, with a
+    persistent on-disk cache (small pre-scaled JPEGs).
+  - A card shows an immediate placeholder the instant it's needed, and
+    swaps in the real image the moment the background load finishes.
+  - Loads are prioritized outward from the centre card.
+
+All-cards pass:
+  - EVERY wallpaper is a card. There is no longer a fixed pool of 47
+    cards, so nothing is missing or blank no matter how fast or how far
+    you scroll.
+  - The strip is virtualized: the carousel keeps one float scroll
+    position and only realises widgets for the cards that are actually
+    on screen (a few dozen), recycling them as you scroll. Cost per frame
+    no longer depends on library size.
+  - Thumbnail masters are center-cropped to the widest region any card
+    can show (instead of the full image), which looks identical but uses
+    ~3.5x less memory, and are kept at the tallest card's full physical
+    resolution. The in-memory cache is an LRU with a byte budget; evicted
+    thumbnails come straight back from the small on-disk cache.
+  - Only a window of thumbnails around the centre is prefetched, not the
+    whole library, on a dedicated pool so decoding never starves the GUI.
+"""
+
+import sys
+import os
+import json
+import math
+import ctypes
+import ctypes.wintypes as wt
+import hashlib
+import threading
+import webbrowser
+
+from collections import OrderedDict
+from pathlib import Path
+
+# ── WinAPI function signatures ───────────────────────────────────────
+# ctypes defaults every windll function to (c_int args) -> c_int, which
+# silently truncates HWNDs (64-bit pointers) on 64-bit Windows. The
+# desktop-reveal window-reparenting trick below passes window handles
+# around, so it needs the real signatures set up front, or
+# FindWindowExW/SetParent etc. will hand back garbage handles.
+_user32 = ctypes.windll.user32
+_user32.FindWindowW.restype     = wt.HWND
+_user32.FindWindowW.argtypes    = [wt.LPCWSTR, wt.LPCWSTR]
+_user32.FindWindowExW.restype   = wt.HWND
+_user32.FindWindowExW.argtypes  = [wt.HWND, wt.HWND, wt.LPCWSTR, wt.LPCWSTR]
+_user32.SetParent.restype       = wt.HWND
+_user32.SetParent.argtypes      = [wt.HWND, wt.HWND]
+_user32.SendMessageTimeoutW.restype  = ctypes.c_void_p
+_user32.SendMessageTimeoutW.argtypes = [
+    wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM,
+    wt.UINT, wt.UINT, ctypes.POINTER(wt.DWORD),
+]
+_WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+_user32.EnumWindows.restype     = wt.BOOL
+_user32.EnumWindows.argtypes    = [_WNDENUMPROC, wt.LPARAM]
+
+from PyQt6.QtCore import (
+    Qt,
+    QPropertyAnimation,
+    QParallelAnimationGroup,
+    QRect,
+    QRectF,
+    QPoint,
+    QPointF,
+    QEasingCurve,
+    QFileSystemWatcher,
+    QTimer,
+    QObject,
+    QRunnable,
+    QThreadPool,
+    pyqtSignal,
+    pyqtProperty,
+)
+from PyQt6.QtGui import (
+    QPixmap,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QColor,
+    QPen,
+    QFont,
+    QCursor,
+    QPolygonF,
+)
+from PyQt6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QLabel,
+    QVBoxLayout,
+    QHBoxLayout,
+    QSizePolicy,
+)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Device pixel ratio — resolved once at startup instead of being
+# queried repeatedly from inside paint/scale hot paths.
+# ═══════════════════════════════════════════════════════════════════
+
+_DPR = 1.0
+
+
+def _init_dpr():
+    global _DPR
+    screen = QApplication.primaryScreen()
+    _DPR = screen.devicePixelRatio() if screen else 1.0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Windows wallpaper setter
+# ═══════════════════════════════════════════════════════════════════
+
+def set_windows_wallpaper(image_path: str):
+    """Set the Windows desktop wallpaper via SystemParametersInfoW."""
+    SPI_SETDESKWALLPAPER = 0x0014
+    SPIF_UPDATEINIFILE   = 0x0001
+    SPIF_SENDCHANGE      = 0x0002
+    try:
+        ctypes.windll.user32.SystemParametersInfoW(
+            SPI_SETDESKWALLPAPER, 0, image_path,
+            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
+        )
+        print(f"[gallery] Wallpaper set: {image_path}")
+    except Exception as e:
+        print(f"[gallery] Could not set wallpaper: {e}")
+
+
+class _WallpaperApplier(QObject):
+    """Sets the Windows wallpaper on a background thread.
+
+    SystemParametersInfoW with SPIF_SENDCHANGE broadcasts to every top
+    level window and can block for a noticeable time, which would freeze
+    the GUI (and the fade-out) if it ran on the GUI thread. `done` is
+    emitted once Windows has returned from the call."""
+
+    done = pyqtSignal()
+
+    def apply(self, path: str):
+        def _work():
+            try:
+                set_windows_wallpaper(path)
+            finally:
+                self.done.emit()
+        threading.Thread(target=_work, daemon=True).start()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Wallpaper discovery
+# ═══════════════════════════════════════════════════════════════════
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv", ".flv"}
+
+APP_DATA_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+    "WallpaperGallery",
+)
+FAVORITES_FILE = os.path.join(APP_DATA_DIR, "favorites.json")
+THUMB_CACHE_DIR = os.path.join(APP_DATA_DIR, "thumbcache")
+
+
+def _load_favorites() -> set[str]:
+    try:
+        with open(FAVORITES_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def _save_favorites(favs: set[str]):
+    try:
+        os.makedirs(os.path.dirname(FAVORITES_FILE), exist_ok=True)
+        with open(FAVORITES_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(favs), f, indent=2)
+    except Exception as e:
+        print(f"[gallery] Could not save favorites: {e}")
+
+
+class Wallpaper:
+    """A single wallpaper (image or video) discovered on disk."""
+
+    def __init__(self, path: str):
+        self.path      = path
+        self.title     = Path(path).stem
+        self.ext       = Path(path).suffix.lower()
+        self.is_image  = self.ext in IMAGE_EXTS
+        self.is_video  = self.ext in VIDEO_EXTS
+        # For images: the file itself is the thumbnail.
+        # For video: we just show a placeholder (no ffmpeg dependency).
+        self.thumbnail_path: str | None = path if self.is_image else None
+
+    def activate(self):
+        if self.is_image:
+            set_windows_wallpaper(self.path)
+        else:
+            print(f"[gallery] Video wallpaper activation not implemented: {self.path}")
+
+    def __repr__(self):
+        return f"<Wallpaper {self.title!r}>"
+
+
+def _wallpaper_search_roots() -> list[str]:
+    """Return candidate folders that usually contain wallpapers."""
+    roots = []
+    userprofile = os.environ.get("USERPROFILE", os.path.expanduser("~"))
+    windir      = os.environ.get("WINDIR", r"C:\Windows")
+
+    # User pictures
+    roots.append(os.path.join(os.environ["OneDrive"], "Pictures", "Wallpapers"))
+
+    return roots
+
+
+def scan_wallpapers(extra_paths: list[str] | None = None) -> list[Wallpaper]:
+    """Recursively find wallpaper files in known locations."""
+    search = _wallpaper_search_roots()
+    if extra_paths:
+        search.extend(extra_paths)
+
+    seen:       set[str]       = set()
+    wallpapers: list[Wallpaper] = []
+
+    for root in search:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for fname in sorted(files):
+                ext = Path(fname).suffix.lower()
+                if ext not in IMAGE_EXTS and ext not in VIDEO_EXTS:
+                    continue
+                full = os.path.join(dirpath, fname)
+                norm = os.path.normcase(full)
+                if norm in seen:
+                    continue
+                seen.add(norm)
+                wallpapers.append(Wallpaper(full))
+                print(f"[gallery] Found: {full}")
+
+    wallpapers.sort(key=lambda w: w.title.lower())
+    print(f"[gallery] Total: {len(wallpapers)} wallpapers")
+    return wallpapers
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Colour-matching helper (for colour filter)
+# ═══════════════════════════════════════════════════════════════════
+
+COLOR_ANCHORS: dict[str, list[tuple[int, int, int]]] = {
+    "red":      [(220, 50, 50),  (180, 30, 30)],
+    "orange":   [(230, 130, 30), (210, 100, 20)],
+    "yellow":   [(240, 210, 40), (200, 180, 20)],
+    "lime":     [(130, 195, 60), (100, 160, 40)],
+    "green":    [(40, 180, 80),  (20, 120, 50)],
+    "teal":     [(30, 170, 150), (20, 130, 120)],
+    "blue":     [(50, 120, 220), (30, 80, 180)],
+    "navy":     [(20, 50, 140),  (10, 30, 100)],
+    "purple":   [(140, 60, 200), (100, 30, 160)],
+    "pink":     [(220, 80, 150), (200, 60, 130)],
+    "hotpink":  [(230, 30, 100), (200, 10, 80)],
+    "blush":    [(240, 180, 200),(220, 150, 170)],
+    "lavender": [(195, 140, 215),(170, 110, 190)],
+    "white":    [(230, 230, 230),(210, 210, 210)],
+    "gray":     [(100, 110, 120),(80,  90, 100)],
+    "black":    [(25,  25,  30), (10,  10,  15)],
+}
+
+
+def _sample_dominant_color(path: str, n: int = 40) -> tuple[int,int,int] | None:
+    try:
+        px = QPixmap(path)
+        if px.isNull():
+            return None
+        sm  = px.scaled(n, n, Qt.AspectRatioMode.IgnoreAspectRatio,
+                        Qt.TransformationMode.FastTransformation)
+        img = sm.toImage()
+        rs = gs = bs = count = 0
+        for y in range(sm.height()):
+            for x in range(sm.width()):
+                c = QColor(img.pixel(x, y))
+                rs += c.red(); gs += c.green(); bs += c.blue(); count += 1
+        return (rs // count, gs // count, bs // count) if count else None
+    except Exception:
+        return None
+
+
+def _color_dist(a, b) -> float:
+    return math.sqrt(sum((x-y)**2 for x, y in zip(a, b)))
+
+
+def _matches_color(wp: Wallpaper, key: str, cache: dict) -> bool:
+    if not wp.thumbnail_path:
+        return False
+    if wp.path not in cache:
+        cache[wp.path] = _sample_dominant_color(wp.thumbnail_path)
+    dom = cache[wp.path]
+    if dom is None:
+        return False
+    return any(_color_dist(dom, a) < 80 for a in COLOR_ANCHORS.get(key, []))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Carousel geometry constants
+# ═══════════════════════════════════════════════════════════════════
+
+# Center card
+CENTER_W  = 200
+CENTER_H  = 600
+
+# Side cards (index 1) – start size
+SIDE1_W   = 160
+SIDE1_H   = 650
+
+# Minimum side card size (applied from index 7 onward)
+SIDE_MIN_W = 100
+SIDE_MIN_H = 240
+
+# How many steps of shrinking before clamping
+SHRINK_STEPS = 7          # indices 1–6 shrink; ≥7 stay at min
+
+# Horizontal gap between adjacent card edges
+CARD_GAP  = 10
+
+# Slide durations, in ms.
+#   ANIM_MS       — a fresh slide starting from rest.
+#   ANIM_MS_FAST  — used when a new scroll input interrupts a slide that's
+#                   still in flight, so rapid scrolling feels snappier
+#                   instead of sluggish.
+ANIM_MS      = 220
+ANIM_MS_FAST = 120
+
+SHEAR_DEG    = 0         # parallelogram lean in degrees
+
+# Opacity applied to non-centre ("side") cards.
+# 1.0 = fully opaque (no dimming), 0.0 = fully transparent.
+# Tweak this decimal to taste.
+SIDE_CARD_OPACITY: float = 0.8
+CENTER_CARD_OPACITY: float = 0.8
+
+# Wallpaper-apply reveal animation
+REVEAL_WIPE_MS = 2000   # <-- adjust this: duration of the diagonal wipe (ms)
+REVEAL_HOLD_MS = 1200   # <-- adjust this: how long the reveal image stays on
+                        #     screen AFTER Windows has set the real wallpaper,
+                        #     so Windows' own wallpaper swap (which can flash
+                        #     blank for about a second) is never visible
+REVEAL_FADE_MS = 280    # duration of the reveal image fading out at the end
+CLOSE_FADE_MS  = 200    # duration of the gallery window fading out/closing
+
+# Thumbnail loading
+THUMB_JPEG_QUALITY = 85
+PREFETCH_SIDE      = 24                   # extra cards prefetched beyond the screen edge
+THUMB_MEM_BUDGET   = 384 * 1024 * 1024    # bytes of decoded thumbnails kept in RAM
+
+
+def shear_for_height(h: int) -> int:
+    return int(h * math.tan(math.radians(SHEAR_DEG)))
+
+
+def _card_size(distance: int) -> tuple[int, int]:
+    """Return (w, h) for a card at `distance` positions from centre."""
+    if distance == 0:
+        return CENTER_W, CENTER_H
+    # Clamp distance to SHRINK_STEPS
+    d = min(distance, SHRINK_STEPS)
+    t = d / SHRINK_STEPS          # 0 → 1
+    w = int(SIDE1_W + t * (SIDE_MIN_W - SIDE1_W))
+    h = int(SIDE1_H + t * (SIDE_MIN_H - SIDE1_H))
+    return w, h
+
+
+def _advance(distance: int) -> int:
+    """Horizontal space one card at `distance` takes, including its gap."""
+    w, h = _card_size(distance)
+    return w + shear_for_height(h) + CARD_GAP
+
+
+def _run(n: int) -> int:
+    """Total horizontal space of the cards at distances 1..n (O(1) for any
+    n, since every card from SHRINK_STEPS onward has the same size)."""
+    if n <= 0:
+        return 0
+    head  = min(n, SHRINK_STEPS)
+    total = sum(_advance(i) for i in range(1, head + 1))
+    if n > head:
+        total += (n - head) * _advance(SHRINK_STEPS)
+    return total
+
+
+def _thumb_master_size() -> tuple[int, int]:
+    """Size (in physical pixels) of the cached thumbnail "master": the
+    tallest card's full height, at the widest aspect ratio any card can
+    show. Every card's view of an image fits inside this crop."""
+    sizes = [_card_size(d) for d in range(SHRINK_STEPS + 1)]
+    max_h = max(h for _w, h in sizes)
+    aspect = max((w + shear_for_height(h) + 4) / h for w, h in sizes)
+    mh = int(max_h * _DPR)
+    return int(math.ceil(aspect * mh)), mh
+
+
+def _thumb_cache_path(path: str) -> str:
+    """Deterministic on-disk cache location for a source image's
+    pre-scaled thumbnail. Keyed on path + mtime + target size, so an
+    edited/replaced file naturally gets a fresh cache entry."""
+    try:
+        mtime = int(os.path.getmtime(path))
+    except OSError:
+        mtime = 0
+    max_w, max_h = _thumb_master_size()
+    key = f"{os.path.normcase(path)}|{max_w}x{max_h}|{mtime}"
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+    return os.path.join(THUMB_CACHE_DIR, digest + ".jpg")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Background thumbnail loading
+# ═══════════════════════════════════════════════════════════════════
+
+class _ThumbnailSignals(QObject):
+    # (source_path, loaded_image) — emitted from the worker thread,
+    # delivered to the GUI thread automatically via a queued connection
+    # because sender and receiver live on different threads.
+    # A null image means "skipped" (no longer wanted).
+    finished = pyqtSignal(str, QImage)
+    failed   = pyqtSignal(str)          # file could not be decoded
+
+
+class ThumbnailLoadTask(QRunnable):
+    """Loads (or generates + caches) a downscaled thumbnail for one
+    wallpaper off the GUI thread. Only QImage is touched here — QPixmap
+    is not thread-safe and must only be created back on the GUI thread."""
+
+    def __init__(self, path: str, is_wanted=None):
+        super().__init__()
+        self.path = path
+        self.is_wanted = is_wanted
+        self.signals = _ThumbnailSignals()
+
+    def run(self):
+        # The user may have scrolled far away while this was queued.
+        if self.is_wanted is not None and not self.is_wanted(self.path):
+            self.signals.finished.emit(self.path, QImage())
+            return
+
+        cache_path = _thumb_cache_path(self.path)
+        image = QImage()
+
+        if os.path.isfile(cache_path):
+            image.load(cache_path)
+
+        if image.isNull():
+            src = QImage(self.path)
+            if src.isNull():
+                self.signals.failed.emit(self.path)
+                return
+            max_w, max_h = _thumb_master_size()
+            if src.width() > max_w or src.height() > max_h:
+                image = src.scaled(
+                    max_w, max_h,
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                # Keep only the centre crop that cards can actually show.
+                cw, ch = min(max_w, image.width()), min(max_h, image.height())
+                image = image.copy((image.width() - cw) // 2,
+                                   (image.height() - ch) // 2, cw, ch)
+            else:
+                image = src
+            try:
+                os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
+                image.save(cache_path, "JPG", THUMB_JPEG_QUALITY)
+            except Exception:
+                pass  # cache write failing is not fatal, just slower next time
+
+        self.signals.finished.emit(self.path, image)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Toolbar geometry
+# ═══════════════════════════════════════════════════════════════════
+
+TB_HEIGHT = 34
+TB_SKEW   = 8
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ThumbCard – parallelogram tile with hover glow
+# ═══════════════════════════════════════════════════════════════════
+
+def _draw_heart(painter: QPainter, x: int, y: int, size: int):
+    path = QPainterPath()
+    w = h = size
+    path.moveTo(x + w/2, y + h*0.85)
+    path.cubicTo(x - w*0.1, y + h*0.5, x - w*0.1, y + h*0.1, x + w/2, y + h*0.3)
+    path.cubicTo(x + w*1.1, y + h*0.1, x + w*1.1, y + h*0.5, x + w/2, y + h*0.85)
+    path.closeSubpath()
+    painter.drawPath(path)
+
+
+class ThumbCard(QWidget):
+    hoverChanged   = pyqtSignal(bool)   # True = mouse entered
+    doubleClicked  = pyqtSignal()       # emitted on double-click while hovered
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap:    QPixmap | None = None
+        self._selected:  bool = False
+        self._distance:  int  = 0
+        self._offset:    int  = 0
+        self._favorited: bool = False
+        self._hovered:   bool = False
+        # Path of the wallpaper currently shown by this card (or None for
+        # an empty/placeholder-only card). Used so an async thumbnail
+        # load can find "am I still showing this?" and swap in-place.
+        self._wp_path: str | None = None
+        # When True, this card is mid-slide: use cheap nearest-neighbour
+        # scaling and skip antialiasing so animation stays smooth. Reset
+        # to False once the strip settles, at which point we re-render
+        # once at full quality.
+        self._fast_mode: bool = False
+        # Last scaled copy of the pixmap, reused while size/mode are unchanged.
+        self._scaled:     QPixmap | None = None
+        self._scaled_key: tuple | None   = None
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+
+    def set_pixmap(self,   v):  self._pixmap    = v; self.update()
+    def set_selected(self, v):  self._selected  = v; self.update()
+    def set_distance(self, v):  self._distance  = v; self.update()
+    def set_favorited(self,v):  self._favorited = v; self.update()
+    def set_offset(self,   v):  self._offset    = v
+    def set_wp_path(self,  v):  self._wp_path   = v
+
+    def set_fast_mode(self, v: bool):
+        if self._fast_mode != v:
+            self._fast_mode = v
+            self.update()
+
+    def _para_path(self, inset: float = 0.0) -> QPainterPath:
+        w, h = self.width(), self.height()
+        s    = shear_for_height(h)
+        path = QPainterPath()
+        path.moveTo(s*0.25 + inset, inset)
+        path.lineTo(w - inset,      inset)
+        path.lineTo(w - s*0.25 - inset, h - inset)
+        path.lineTo(inset,          h - inset)
+        path.closeSubpath()
+        return path
+
+    def paintEvent(self, event):
+        if not self._pixmap:
+            return
+        painter = QPainter(self)
+
+        # Cheap rendering while sliding: no antialiasing, no smooth
+        # pixmap filter hint. Restored to full quality once at rest.
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, not self._fast_mode)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, not self._fast_mode)
+
+        pen_width   = 2.2 if self._hovered else 0.0
+        fill_path   = self._para_path(0)
+        border_path = self._para_path(pen_width / 2)
+
+        # Side cards can be made translucent via SIDE_CARD_OPACITY; the
+        # centre card uses CENTER_CARD_OPACITY.
+        painter.setOpacity(
+                         CENTER_CARD_OPACITY
+                         if self._distance == 0
+                         else SIDE_CARD_OPACITY
+                      )
+
+        # ── background fill ──
+        painter.setClipPath(fill_path)
+        painter.fillPath(fill_path, QColor("#1a1a2e"))
+
+        # ── image ───────────
+        w, h = self.width(), self.height()
+        s    = shear_for_height(h)
+        dpr    = _DPR
+        phys_w = int((w + s) * dpr)
+        phys_h = int(h       * dpr)
+
+        transform_mode = (
+            Qt.TransformationMode.FastTransformation
+            if self._fast_mode
+            else Qt.TransformationMode.SmoothTransformation
+        )
+        key = (self._pixmap.cacheKey(), phys_w, phys_h, self._fast_mode)
+        if key != self._scaled_key:
+            scaled = self._pixmap.scaled(
+                phys_w, phys_h,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                transform_mode,
+            )
+            scaled.setDevicePixelRatio(dpr)
+            self._scaled, self._scaled_key = scaled, key
+        scaled = self._scaled
+        sx = max(0, (scaled.width()  - phys_w) // 2)
+        sy = max(0, (scaled.height() - phys_h) // 2)
+        painter.drawPixmap(0, 0, scaled, sx, sy, phys_w, phys_h)
+
+        # ── outline ─────────
+        painter.setClipping(False)
+        painter.setOpacity(1.0)
+        if self._hovered:
+            # bright glow on hover, only on this individual card
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor("#ffffff"), 2.2))
+            painter.drawPath(border_path)
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        self.hoverChanged.emit(True)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        self.hoverChanged.emit(False)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Desktop WorkerW lookup — the "live wallpaper" trick
+# ─────────────────────────────────────────────────────────────────────
+# Explorer keeps a hidden, empty WorkerW window sandwiched between the
+# real wallpaper and the desktop icons (it's a leftover hook from the
+# old Active Desktop feature). Wallpaper Engine / Lively Wallpaper and
+# friends draw into that same window, which is why their content shows
+# up behind your icons instead of covering them. We do the same thing
+# for the reveal wipe: it IS the desktop for the duration of the
+# animation, so it renders underneath every open application window and
+# can never paint over them.
+#
+# This depends on undocumented Explorer internals, so behaviour can
+# vary slightly across Windows builds; if the WorkerW can't be found,
+# `attach_to_desktop()` returns False and the window stays a plain
+# always-on-bottom window instead of failing outright.
+# ═══════════════════════════════════════════════════════════════════
+
+def _find_desktop_workerw() -> int:
+    """Return the HWND of the WorkerW that sits behind the desktop
+    icons (and in front of the real wallpaper), or 0 if not found."""
+    progman = _user32.FindWindowW("Progman", None)
+    if progman:
+        # Ask Progman to spawn its legacy WorkerW hierarchy. Most
+        # builds already have one; this is a harmless no-op if so.
+        _user32.SendMessageTimeoutW(progman, 0x052C, 0, 0, 0x0, 1000, None)
+
+    found = {"hwnd": 0}
+
+    def _enum(hwnd, _lparam):
+        shell_view = _user32.FindWindowExW(hwnd, None, "SHELLDLL_DefView", None)
+        if shell_view:
+            # The icons live in `hwnd`. The WorkerW immediately after it
+            # in z-order is the empty one we can draw on.
+            found["hwnd"] = _user32.FindWindowExW(None, hwnd, "WorkerW", None)
+        return True
+
+    _user32.EnumWindows(_WNDENUMPROC(_enum), 0)
+    return found["hwnd"] or 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DesktopRevealWindow – diagonal wipe used when a wallpaper is applied,
+# built fresh for every activation. The new image sweeps in from the
+# top-right corner to the bottom-left corner of the screen.
+#
+# This is a top-level window with no Qt parent — after it's shown,
+# `attach_to_desktop()` reparents its native handle straight into
+# Explorer's own WorkerW, so it renders beneath every application
+# window and beneath the desktop icons, directly on top of the real
+# (soon to be replaced) wallpaper. Once the real wallpaper is set and
+# Windows has finished swapping it, the caller fades this window away
+# through the `fadeOpacity` property (painter opacity, so it works the
+# same whether or not the window is parented into the desktop).
+# ═══════════════════════════════════════════════════════════════════
+
+class DesktopRevealWindow(QWidget):
+    def __init__(self, pixmap: QPixmap, geometry: QRect):
+        super().__init__(None)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowStaysOnBottomHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        self._pixmap   = pixmap
+        self._progress = 0.0          # 0 = nothing revealed, 1 = fully
+        self._fade     = 1.0          # 1 = fully visible, 0 = invisible
+        self.setGeometry(geometry)
+
+    def attach_to_desktop(self) -> bool:
+        """Reparent this window's native handle into the desktop WorkerW
+        so it paints behind the icons and every application window.
+        Must be called after `show()` so the native handle actually
+        exists. Returns False (and leaves the window as a plain
+        always-on-bottom top-level window) if the WorkerW can't be
+        found on this Windows build."""
+        worker = _find_desktop_workerw()
+        if not worker:
+            print("[gallery] Desktop WorkerW not found; reveal will stay a plain bottom window.")
+            return False
+        _user32.SetParent(int(self.winId()), worker)
+        return True
+
+    # -- animatable "progress" property ------------------------------
+    def _get_progress(self) -> float:
+        return self._progress
+
+    def _set_progress(self, value: float):
+        self._progress = value
+        self.update()
+
+    progress = pyqtProperty(float, fget=_get_progress, fset=_set_progress)
+
+    # -- animatable "fadeOpacity" property ---------------------------
+    def _get_fade(self) -> float:
+        return self._fade
+
+    def _set_fade(self, value: float):
+        self._fade = value
+        self.update()
+
+    fadeOpacity = pyqtProperty(float, fget=_get_fade, fset=_set_fade)
+
+    def _wipe_polygon(self) -> QPolygonF:
+        """Region on the top-right side of the moving diagonal edge."""
+        w, h = self.width(), self.height()
+        # t = (w - x) + y runs from 0 (top-right) to w+h (bottom-left).
+        T   = self._progress * (w + h)
+        big = w + h + 10
+        return QPolygonF([
+            QPointF(0, T - w),      # edge at x = 0
+            QPointF(w, T),          # edge at x = w
+            QPointF(w, -big),
+            QPointF(0, -big),
+        ])
+
+    def paintEvent(self, event):
+        if self._pixmap.isNull() or self._progress <= 0 or self._fade <= 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setOpacity(self._fade)
+        painter.setClipRect(event.rect())
+        path = QPainterPath()
+        path.addPolygon(self._wipe_polygon())
+        path.closeSubpath()
+        painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
+        painter.drawPixmap(0, 0, self._pixmap)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CarouselStrip
+#
+# Virtualized: `_scroll` is a float position in "card index" units
+# (integer = settled on that card). Every wallpaper has a card in the
+# layout, but only the ones intersecting the strip get a real widget.
+# A card at index i sits between its layout for the floor(scroll) slot
+# and the next one, so a slide is just an animation of `_scroll`.
+# ═══════════════════════════════════════════════════════════════════
+
+class CarouselStrip(QWidget):
+    selectionChanged  = pyqtSignal(int)
+    cardDoubleClicked = pyqtSignal(int)   # emits the offset (from centre) that was double-clicked
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumHeight(CENTER_H + 80)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        self.wallpapers:    list[Wallpaper] = []
+        self.current_index: int             = 0
+        self._favorites:    set[str]        = set()
+
+        # In-memory thumbnail cache: an LRU bounded by THUMB_MEM_BUDGET.
+        # It is NOT cleared on filter changes or rescans; evicted entries
+        # reload quickly from the small on-disk cache.
+        self._thumb_cache:       "OrderedDict[str, QPixmap]" = OrderedDict()
+        self._thumb_cache_bytes: int      = 0
+        self._pending_loads:     set[str] = set()
+        self._failed:            set[str] = set()
+        self._wanted:            set[str] = set()   # window around the centre
+        self._threadpool = QThreadPool(self)
+        self._threadpool.setMaxThreadCount(max(2, min(4, (os.cpu_count() or 4) // 2)))
+        self._placeholder_px = QPixmap(16, 16)
+        self._placeholder_px.fill(QColor("#20203a"))
+
+        # Card widgets: index -> card for the ones in use, plus a spare pool.
+        self._active: dict[int, ThumbCard] = {}
+        self._spare:  list[ThumbCard]      = []
+        self._fast_mode      = False
+        self._stack_nearest  = None
+        self._side_cache     = None
+
+        self._scroll: float = 0.0
+        self._scroll_anim: QPropertyAnimation | None = None
+
+    # -- animatable "scroll" property --------------------------------
+    def _get_scroll(self) -> float:
+        return self._scroll
+
+    def _set_scroll(self, value: float):
+        self._scroll = value
+        self._layout_cards()
+
+    scroll = pyqtProperty(float, fget=_get_scroll, fset=_set_scroll)
+
+    # ── geometry ─────────────────────────────────────────────────────
+
+    def _cy(self) -> int:
+        return self.height() // 2
+
+    def _x_for_offset(self, offset: int) -> int:
+        """Compute the left-edge x of the card at `offset` from centre."""
+        cx = self.width() // 2
+
+        if offset == 0:
+            cw, ch = CENTER_W, CENTER_H
+            s = shear_for_height(ch)
+            return cx - (cw + s) // 2
+
+        # Each card butts against the previous one with CARD_GAP.
+        half = (CENTER_W + shear_for_height(CENTER_H)) // 2
+        if offset > 0:
+            return cx + half + CARD_GAP + _run(offset - 1)
+        w_cur, h_cur = _card_size(-offset)
+        s_cur = shear_for_height(h_cur)
+        return cx - half - CARD_GAP - _run(-offset - 1) - (w_cur + s_cur)
+
+    def _rect_for_offset(self, offset: int) -> QRect:
+        cy   = self._cy()
+        w, h = _card_size(abs(offset))
+        s    = shear_for_height(h)
+        x    = self._x_for_offset(offset)
+        y    = cy - h // 2
+        return QRect(x, y, w + s + 4, h)
+
+    def _side_count(self) -> int:
+        """How many cards each side of centre can possibly be on screen
+        (plus a one-card margin)."""
+        width = self.width()
+        if self._side_cache and self._side_cache[0] == width:
+            return self._side_cache[1]
+        k = 1
+        while self._x_for_offset(k) < width and k < 100000:
+            k += 1
+        self._side_cache = (width, k + 1)
+        return k + 1
+
+    # ── public API ────────────────────────────────────────────────────
+
+    def set_favorites(self, favs: set[str]):
+        self._favorites = favs
+        self._rebuild()
+
+    def set_wallpapers(self, wallpapers: list[Wallpaper], preserve_index: bool = False):
+        old_path = (
+            self.wallpapers[self.current_index].path
+            if preserve_index and self.wallpapers else None
+        )
+        self._stop_anim()
+        self.wallpapers = wallpapers
+        # NOTE: the thumbnail cache is intentionally NOT cleared here.
+
+        if old_path and wallpapers:
+            for i, wp in enumerate(wallpapers):
+                if wp.path == old_path:
+                    self.current_index = i; break
+            else:
+                self.current_index = min(self.current_index, max(0, len(wallpapers)-1))
+        else:
+            self.current_index = 0
+        self._scroll = float(self.current_index)
+        self._release_all_cards()      # index -> wallpaper mapping changed
+        self._update_prefetch_window()
+        self._rebuild()
+
+    def navigate(self, delta: int):
+        if not self.wallpapers or delta == 0:
+            return
+        new_index = self.current_index + delta
+        if new_index < 0 or new_index >= len(self.wallpapers):
+            return
+
+        # If a slide is already mid-flight, continue from exactly where
+        # the strip currently is, with the shorter duration.
+        was_running = self._is_animating()
+        self._stop_anim()
+
+        self.current_index = new_index
+        self._update_prefetch_window()
+
+        # Cheap rendering for the duration of the slide; restored to full
+        # quality by `_rebuild()` once the animation settles.
+        self._set_cards_fast_mode(True)
+
+        anim = QPropertyAnimation(self, b"scroll", self)
+        anim.setDuration(ANIM_MS_FAST if was_running else ANIM_MS)
+        anim.setStartValue(self._scroll)
+        anim.setEndValue(float(new_index))
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.finished.connect(lambda a=anim: self._on_slide_finished(new_index, a))
+        self._scroll_anim = anim
+        anim.start()
+
+    def current_wallpaper(self) -> Wallpaper | None:
+        return self.wallpapers[self.current_index] if self.wallpapers else None
+
+    def center_card_rect(self) -> QRect | None:
+        """Geometry (in this widget's coordinates) of the centre slot."""
+        return self._rect_for_offset(0) if self.wallpapers else None
+
+    # ── fast/quality mode helper ─────────────────────────────────────
+
+    def _set_cards_fast_mode(self, fast: bool):
+        self._fast_mode = fast
+        for c in self._active.values():
+            c.set_fast_mode(fast)
+        for c in self._spare:
+            c.set_fast_mode(fast)
+
+    def _is_animating(self) -> bool:
+        a = self._scroll_anim
+        return a is not None and a.state() == QPropertyAnimation.State.Running
+
+    # ── thumbnail loading (async, cached, bounded) ───────────────────
+
+    def _is_wanted(self, path: str) -> bool:
+        return path in self._wanted           # called from worker threads
+
+    def _request_thumbnail(self, path: str, priority: int = 0):
+        """Kick off a background load for `path` if it isn't already
+        cached or already in flight. Non-blocking — the GUI thread never
+        touches the disk here."""
+        if path in self._thumb_cache or path in self._pending_loads or path in self._failed:
+            return
+        self._pending_loads.add(path)
+        self._wanted.add(path)
+        task = ThumbnailLoadTask(path, self._is_wanted)
+        task.signals.finished.connect(self._on_thumbnail_loaded)
+        task.signals.failed.connect(self._on_thumbnail_failed)
+        self._threadpool.start(task, priority)
+
+    def _on_thumbnail_failed(self, path: str):
+        self._pending_loads.discard(path)
+        self._failed.add(path)
+
+    def _on_thumbnail_loaded(self, path: str, image: QImage):
+        self._pending_loads.discard(path)
+        if image.isNull():
+            return
+        pixmap = QPixmap.fromImage(image)
+        old = self._thumb_cache.pop(path, None)
+        if old is not None:
+            self._thumb_cache_bytes -= old.width() * old.height() * 4
+        self._thumb_cache[path] = pixmap
+        self._thumb_cache_bytes += pixmap.width() * pixmap.height() * 4
+        self._evict_thumbnails()
+        # Swap the image into any card currently showing this wallpaper,
+        # in place — no relayout, so this is safe even mid-slide.
+        for card in self._active.values():
+            if card._wp_path == path:
+                card.set_pixmap(pixmap)
+
+    def _evict_thumbnails(self):
+        """Drop least-recently-used thumbnails over the memory budget,
+        never ones that a card is showing right now."""
+        if self._thumb_cache_bytes <= THUMB_MEM_BUDGET:
+            return
+        shown = {c._wp_path for c in self._active.values()}
+        for key in list(self._thumb_cache):
+            if self._thumb_cache_bytes <= THUMB_MEM_BUDGET:
+                break
+            if key in shown:
+                continue
+            px = self._thumb_cache.pop(key)
+            self._thumb_cache_bytes -= px.width() * px.height() * 4
+
+    def _update_prefetch_window(self):
+        """Queue loads for the cards around the centre (what's on screen
+        plus PREFETCH_SIDE more each way), nearest first, and forget
+        everything outside that window so stale queued loads are skipped."""
+        n = len(self.wallpapers)
+        if n == 0:
+            self._wanted = set()
+            return
+        reach = self._side_count() + PREFETCH_SIDE
+        cur   = self.current_index
+        idxs  = sorted(range(max(0, cur - reach), min(n - 1, cur + reach) + 1),
+                       key=lambda i: abs(i - cur))
+        self._wanted = {self.wallpapers[i].thumbnail_path
+                        for i in idxs if self.wallpapers[i].thumbnail_path}
+        for i in idxs:
+            path = self.wallpapers[i].thumbnail_path
+            if path:
+                self._request_thumbnail(path, priority=-abs(i - cur))
+
+    def _pixmap_for_index(self, idx: int) -> tuple[QPixmap, str | None]:
+        """Returns (pixmap_to_show_now, wallpaper_path_or_None). If the real
+        thumbnail isn't cached yet it is requested and a placeholder is
+        returned; it pops in the instant the load finishes."""
+        path = self.wallpapers[idx].thumbnail_path
+        if not path:
+            return self._placeholder_px, None
+        cached = self._thumb_cache.get(path)
+        if cached is not None:
+            self._thumb_cache.move_to_end(path)
+            return cached, path
+        self._request_thumbnail(path, priority=-abs(idx - self.current_index))
+        return self._placeholder_px, path
+
+    # ── card pool ─────────────────────────────────────────────────────
+
+    def _make_card(self) -> ThumbCard:
+        card = ThumbCard(self)
+        card.hide()
+        card.doubleClicked.connect(lambda c=card: self._on_card_double_clicked(c))
+        return card
+
+    def _acquire_card(self, idx: int) -> ThumbCard:
+        card = self._spare.pop() if self._spare else self._make_card()
+        card.set_fast_mode(self._fast_mode)
+        pix, path = self._pixmap_for_index(idx)
+        card.set_pixmap(pix)
+        card.set_wp_path(path)
+        self._active[idx] = card
+        return card
+
+    def _release_card(self, idx: int):
+        card = self._active.pop(idx)
+        card.hide()
+        card.set_pixmap(None)
+        card.set_wp_path(None)
+        self._spare.append(card)
+
+    def _release_all_cards(self):
+        for idx in list(self._active):
+            self._release_card(idx)
+        self._stack_nearest = None
+
+    # ── layout ────────────────────────────────────────────────────────
+
+    def _layout_cards(self):
+        """Place every card that is (or is about to be) on screen for the
+        current `_scroll` position."""
+        n = len(self.wallpapers)
+        if n == 0:
+            self._release_all_cards()
+            return
+
+        scroll  = min(max(self._scroll, 0.0), float(n - 1))
+        base    = int(math.floor(scroll))
+        frac    = scroll - base
+        if frac < 1e-4:
+            frac = 0.0
+        nearest = base + (1 if frac >= 0.5 else 0)
+        reach   = self._side_count()
+        lo, hi  = max(0, base - reach), min(n - 1, base + 1 + reach)
+
+        for idx in [i for i in self._active if i < lo or i > hi]:
+            self._release_card(idx)
+
+        view = self.rect()
+        restack = nearest != self._stack_nearest
+        for idx in range(lo, hi + 1):
+            r0 = self._rect_for_offset(idx - base)
+            if frac:
+                r1 = self._rect_for_offset(idx - base - 1)
+                rect = QRect(
+                    int(round(r0.x()      + (r1.x()      - r0.x())      * frac)),
+                    int(round(r0.y()      + (r1.y()      - r0.y())      * frac)),
+                    int(round(r0.width()  + (r1.width()  - r0.width())  * frac)),
+                    int(round(r0.height() + (r1.height() - r0.height()) * frac)),
+                )
+            else:
+                rect = r0
+
+            card = self._active.get(idx)
+            if not rect.intersects(view):
+                if card is not None:
+                    card.hide()
+                continue
+            if card is None:
+                card = self._acquire_card(idx)
+                restack = True
+
+            card.setGeometry(rect)
+            dist = abs(idx - nearest)
+            card.set_offset(idx - self.current_index)
+            if card._distance != dist:
+                card.set_distance(dist)
+            if card._selected != (dist == 0):
+                card.set_selected(dist == 0)
+            fav = self.wallpapers[idx].path in self._favorites
+            if card._favorited != fav:
+                card.set_favorited(fav)
+            if not card.isVisible():
+                card.show()
+
+        if restack:
+            self._restack(nearest)
+
+    def _restack(self, nearest: int):
+        # Re-stack so centre is always on top of side cards
+        for idx, card in self._active.items():
+            if idx != nearest:
+                card.lower()
+        centre = self._active.get(nearest)
+        if centre is not None:
+            centre.raise_()
+        self._stack_nearest = nearest
+
+    def _rebuild(self):
+        """Snap to the current scroll position at full quality. Used for
+        the initial layout, filter/favourite changes and window resizes,
+        and as the final settle step after a slide finishes."""
+        self._set_cards_fast_mode(self._is_animating())
+        self._layout_cards()
+
+    def wheelEvent(self, event):
+        self.navigate(-1 if event.angleDelta().y() > 0 else 1)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rebuild()
+        self._update_prefetch_window()
+
+    # ── double-click handling ────────────────────────────────────────
+
+    def _on_card_double_clicked(self, card: "ThumbCard"):
+        """Double-clicking a card brings it to the centre (if it isn't
+        already) and asks the parent to activate it as the wallpaper."""
+        offset = card._offset
+        if offset != 0:
+            self.navigate(offset)
+        self.cardDoubleClicked.emit(offset)
+
+    # ── animation ─────────────────────────────────────────────────────
+
+    def _stop_anim(self):
+        if self._scroll_anim is not None:
+            self._scroll_anim.stop()
+            self._scroll_anim.deleteLater()
+            self._scroll_anim = None
+
+    def _on_slide_finished(self, target_index: int, anim: QPropertyAnimation):
+        # Ignore a stale finished signal from an animation we've already
+        # superseded/interrupted.
+        if self._scroll_anim is not anim:
+            return
+        self._scroll_anim = None
+        anim.deleteLater()
+        self._scroll = float(target_index)
+        self._rebuild()
+        self.selectionChanged.emit(target_index)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MainWindow
+# ═══════════════════════════════════════════════════════════════════
+
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowTitle("Wallpaper Gallery")
+
+        # state
+        self._all_wallpapers:      list[Wallpaper] = []
+        self._filtered_wallpapers: list[Wallpaper] = []
+        self._favorites:           set[str]        = _load_favorites()
+        self._active_filter        = "all"
+        self._color_filter:        str | None      = None
+        self._color_cache:         dict            = {}
+        self._fav_filter           = False
+
+        # keep references to in-flight reveal-animation objects so they
+        # aren't garbage-collected mid-animation
+        self._reveal_overlay = None
+        self._reveal_anim    = None
+        self._reveal_fade    = None
+
+        # Shutdown bookkeeping. The app only exits once EVERYTHING is
+        # done: the gallery window has faded out AND the reveal image
+        # (wipe + wallpaper apply + hold + fade) is completely finished.
+        self._closing       = False    # a wallpaper apply + close is in progress
+        self._main_fading   = False    # gallery fade-out already started
+        self._main_faded    = False    # gallery fade-out finished
+        self._overlay_done  = True     # reveal image is gone (or never existed)
+
+        # Sets the real wallpaper off the GUI thread.
+        self._applier = _WallpaperApplier(self)
+        self._applier.done.connect(self._on_wallpaper_applied,
+                                   Qt.ConnectionType.QueuedConnection)
+
+        self._all_wallpapers      = scan_wallpapers()
+        self._filtered_wallpapers = list(self._all_wallpapers)
+
+        # carousel
+        self.carousel = CarouselStrip()
+        self.carousel.set_wallpapers(self._filtered_wallpapers)
+        self.carousel.set_favorites(self._favorites)
+        self.carousel.selectionChanged.connect(self._on_sel)
+        self.carousel.cardDoubleClicked.connect(self._on_card_double_clicked)
+
+        # config overlay
+        self._config_overlay = None
+
+        # layout
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 24, 24, 24)
+        root.setSpacing(10)
+        root.addStretch()
+        root.addWidget(self.carousel)
+        root.addStretch()
+
+        # library watcher — watch user Pictures folder
+        userprofile = os.environ.get("USERPROFILE", os.path.expanduser("~"))
+        watch_paths = [
+            os.path.join(userprofile, "Pictures"),
+            os.path.join(userprofile, "Pictures", "Wallpapers"),
+        ]
+        watch_paths = [p for p in watch_paths if os.path.isdir(p)]
+        self._watcher = QFileSystemWatcher(watch_paths)
+        self._watcher.directoryChanged.connect(self._on_dir_changed)
+        self._reload_timer = QTimer(self)
+        self._reload_timer.setSingleShot(True)
+        self._reload_timer.setInterval(600)
+        self._reload_timer.timeout.connect(self._reload_library)
+
+        # fade in
+        self.setWindowOpacity(0)
+        self.fade_in = QPropertyAnimation(self, b"windowOpacity")
+        self.fade_in.setDuration(250)
+        self.fade_in.setStartValue(0)
+        self.fade_in.setEndValue(1)
+        self.fade_in.start()
+
+        self.showFullScreen()
+
+    # filtering
+    def _apply_filters(self):
+        result = list(self._all_wallpapers)
+        if self._fav_filter:
+            result = [w for w in result if w.path in self._favorites]
+        elif self._active_filter == "pic":
+            result = [w for w in result if w.is_image]
+        elif self._active_filter == "vid":
+            result = [w for w in result if w.is_video]
+        # WE: unknown category for now — show all
+        if self._color_filter:
+            result = [w for w in result
+                      if _matches_color(w, self._color_filter, self._color_cache)]
+        self._filtered_wallpapers = result
+        self.carousel.set_wallpapers(result, preserve_index=True)
+        self.carousel.set_favorites(self._favorites)
+
+    # favourites
+    def _toggle_favourite(self):
+        wp = self.carousel.current_wallpaper()
+        if not wp: return
+        if wp.path in self._favorites:
+            self._favorites.discard(wp.path)
+        else:
+            self._favorites.add(wp.path)
+        _save_favorites(self._favorites)
+        self.carousel.set_favorites(self._favorites)
+        if self._fav_filter: self._apply_filters()
+
+    # library reload
+    def _on_dir_changed(self, _):
+        if not self._closing:
+            self._reload_timer.start()
+
+    def _reload_library(self):
+        if self._closing:
+            return
+        self._all_wallpapers = scan_wallpapers()
+        self._color_cache.clear()
+        self._apply_filters()
+
+    # ui updates
+    def _on_sel(self, _):
+        pass
+
+    # double-click on a card (hovered card) activates it as the wallpaper.
+    # If the card wasn't already centred, the carousel has already been
+    # asked to slide it there — `current_index` reflects that target
+    # immediately, so activating right away is safe.
+    def _on_card_double_clicked(self, _offset):
+        self._activate_current()
+
+    # keyboard
+    def keyPressEvent(self, event):
+        if self._closing:
+            return                      # a wallpaper is being applied; ignore input
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
+            self._fade_close()
+        elif key in (Qt.Key.Key_Left, Qt.Key.Key_Up):
+            self.carousel.navigate(-1)
+        elif key in (Qt.Key.Key_Right, Qt.Key.Key_Down):
+            self.carousel.navigate(1)
+        elif key == Qt.Key.Key_F:
+            self._toggle_favourite()
+
+    # ── wallpaper-apply reveal animation ──────────────────────────────
+
+    def _fullscreen_pixmap(self, path: str, size) -> QPixmap:
+        """Scale+crop the image at `path` to exactly fill `size`
+        (a QSize), the same way a wallpaper would be displayed."""
+        src = QPixmap(path)
+        if src.isNull():
+            return QPixmap()
+        scaled = src.scaled(
+            size,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = max(0, (scaled.width()  - size.width())  // 2)
+        y = max(0, (scaled.height() - size.height()) // 2)
+        return scaled.copy(x, y, size.width(), size.height())
+
+    def _activate_current(self):
+        if self._closing:
+            return                      # already applying one; ignore extra double-clicks
+        wp = self.carousel.current_wallpaper()
+        if not wp or not wp.is_image:
+            return
+
+        screen = self.screen() or QApplication.primaryScreen()
+        screen_geo = screen.geometry()
+
+        full_pix = self._fullscreen_pixmap(wp.path, screen_geo.size())
+
+        # The wallpaper has been selected: from this moment the process
+        # is "in progress". The app will not exit until the wipe has
+        # played, Windows has applied the wallpaper, the hold time has
+        # elapsed and the reveal image has faded away.
+        self._closing      = True
+        self._overlay_done = False
+
+        if full_pix.isNull():
+            # Fallback: no smooth reveal possible. Apply directly; the
+            # app exits once Windows reports done (see
+            # `_on_wallpaper_applied`, which handles "no overlay").
+            self._applier.apply(wp.path)
+            self._fade_close()
+            return
+
+        # Clean up any reveal still in flight from a previous activation.
+        if self._reveal_overlay is not None:
+            self._reveal_overlay.close()
+            self._reveal_overlay.deleteLater()
+            self._reveal_overlay = None
+
+        # The reveal window covers exactly the target screen; its own
+        # coordinate space starts at (0, 0) regardless of where the
+        # screen sits on the virtual desktop.
+        local_geo = QRect(0, 0, screen_geo.width(), screen_geo.height())
+
+        overlay = DesktopRevealWindow(full_pix, local_geo)
+        overlay.move(screen_geo.topLeft())
+        overlay.show()
+        overlay.attach_to_desktop()
+
+        expand = QPropertyAnimation(overlay, b"progress")
+        expand.setDuration(REVEAL_WIPE_MS)
+        expand.setStartValue(0.0)
+        expand.setEndValue(1.0)
+        expand.setEasingCurve(QEasingCurve.Type.OutQuint)
+
+        def _on_expanded():
+            # The wipe now fully covers the screen with the new image.
+            # Set the real wallpaper on a background thread. The reveal
+            # image STAYS on screen; it is only removed a moment after
+            # Windows reports the change (see `_on_wallpaper_applied`),
+            # which hides the blank gap Windows shows while it swaps
+            # its own wallpaper.
+            self._applier.apply(wp.path)
+
+        expand.finished.connect(_on_expanded)
+        self._reveal_overlay = overlay
+        self._reveal_anim    = expand
+        expand.start()
+
+        # Fade the gallery out right away, so the wipe is visible on the
+        # desktop as it plays. The app keeps running in the background
+        # until the whole process is finished.
+        self._fade_close()
+
+    def _on_wallpaper_applied(self):
+        """Windows has returned from setting the wallpaper. Keep the
+        reveal image up a little longer, then fade it away."""
+        QTimer.singleShot(REVEAL_HOLD_MS, self._fade_out_overlay)
+
+    def _fade_out_overlay(self):
+        overlay = self._reveal_overlay
+        if overlay is None:
+            self._overlay_done = True
+            self._maybe_quit()
+            return
+
+        fade = QPropertyAnimation(overlay, b"fadeOpacity")
+        fade.setDuration(REVEAL_FADE_MS)
+        fade.setStartValue(1.0)
+        fade.setEndValue(0.0)
+        fade.setEasingCurve(QEasingCurve.Type.InOutQuad)
+
+        def _on_faded():
+            overlay.close()
+            overlay.deleteLater()
+            if self._reveal_overlay is overlay:
+                self._reveal_overlay = None
+                self._reveal_fade    = None
+            self._overlay_done = True
+            self._maybe_quit()
+
+        fade.finished.connect(_on_faded)
+        self._reveal_fade = fade
+        fade.start()
+
+    # ── closing ───────────────────────────────────────────────────────
+
+    def _fade_close(self):
+        """Fade the gallery out and close it (Esc, or as soon as a
+        wallpaper is selected). The app exits only once nothing else is
+        still showing or working."""
+        if self._main_fading:
+            return
+        self._main_fading = True
+        self.fade_out = QPropertyAnimation(self, b"windowOpacity")
+        self.fade_out.setDuration(CLOSE_FADE_MS)
+        self.fade_out.setStartValue(self.windowOpacity())
+        self.fade_out.setEndValue(0)
+        self.fade_out.finished.connect(self._on_main_faded)
+        self.fade_out.start()
+
+    def _on_main_faded(self):
+        self._main_faded = True
+        self.close()
+        self._maybe_quit()
+
+    def _maybe_quit(self):
+        """Exit only when the gallery has faded out AND the whole
+        wallpaper-apply process (wipe, apply, hold, fade) is finished."""
+        if self._main_faded and self._overlay_done:
+            QApplication.quit()
+
+# ═══════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+    app = QApplication(sys.argv)
+    # The app is quit explicitly (see MainWindow._maybe_quit) so the
+    # reveal image can outlive the gallery window while Windows swaps
+    # the real wallpaper.
+    app.setQuitOnLastWindowClosed(False)
+    _init_dpr()
+    window = MainWindow()
+    window.showFullScreen()
+    sys.exit(app.exec())
